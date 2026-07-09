@@ -29,6 +29,24 @@
 	--warn: oklch(0.79 0.14 85);
 	--err: oklch(0.66 0.19 25);
 
+	/* syntax — transcript code blocks, GitHub Dark */
+	--syntax-bg: #0d1117;
+	--syntax-fg: #c9d1d9;
+	--syntax-keyword: #ff7b72;
+	--syntax-entity: #d2a8ff;
+	--syntax-constant: #79c0ff;
+	--syntax-string: #a5d6ff;
+	--syntax-variable: #ffa657;
+	--syntax-comment: #8b949e;
+	--syntax-entity-tag: #7ee787;
+	--syntax-subst: #c9d1d9;
+	--syntax-heading: #1f6feb;
+	--syntax-list: #f2cc60;
+	--syntax-addition-fg: #aff5b4;
+	--syntax-addition-bg: #033a16;
+	--syntax-deletion-fg: #ffdcd7;
+	--syntax-deletion-bg: #67060c;
+
 	/* hairlines */
 	--border: oklch(1 0 0 / 9%);
 	--border-strong: oklch(1 0 0 / 13%);
@@ -71,6 +89,24 @@
 	--warn: oklch(0.6 0.13 85);
 	--err: oklch(0.55 0.19 25);
 
+	/* syntax — transcript code blocks, GitHub Light */
+	--syntax-bg: #ffffff;
+	--syntax-fg: #24292e;
+	--syntax-keyword: #d73a49;
+	--syntax-entity: #6f42c1;
+	--syntax-constant: #005cc5;
+	--syntax-string: #032f62;
+	--syntax-variable: #e36209;
+	--syntax-comment: #6a737d;
+	--syntax-entity-tag: #22863a;
+	--syntax-subst: #24292e;
+	--syntax-heading: #005cc5;
+	--syntax-list: #735c0f;
+	--syntax-addition-fg: #22863a;
+	--syntax-addition-bg: #f0fff4;
+	--syntax-deletion-fg: #b31d28;
+	--syntax-deletion-bg: #ffeef0;
+
 	--border: oklch(0 0 0 / 10%);
 	--border-strong: oklch(0 0 0 / 15%);
 	--ring: oklch(0.58 0.13 230 / 70%);
@@ -101,6 +137,23 @@
 		--ok: oklch(0.55 0.13 150);
 		--warn: oklch(0.6 0.13 85);
 		--err: oklch(0.55 0.19 25);
+
+		--syntax-bg: #ffffff;
+		--syntax-fg: #24292e;
+		--syntax-keyword: #d73a49;
+		--syntax-entity: #6f42c1;
+		--syntax-constant: #005cc5;
+		--syntax-string: #032f62;
+		--syntax-variable: #e36209;
+		--syntax-comment: #6a737d;
+		--syntax-entity-tag: #22863a;
+		--syntax-subst: #24292e;
+		--syntax-heading: #005cc5;
+		--syntax-list: #735c0f;
+		--syntax-addition-fg: #22863a;
+		--syntax-addition-bg: #f0fff4;
+		--syntax-deletion-fg: #b31d28;
+		--syntax-deletion-bg: #ffeef0;
 
 		--border: oklch(0 0 0 / 10%);
 		--border-strong: oklch(0 0 0 / 15%);
