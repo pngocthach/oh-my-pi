@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Added syntax highlighting and copy buttons for transcript Markdown code blocks in the collab web client.
+
 ## [16.3.7] - 2026-07-05
 
 ### Fixed

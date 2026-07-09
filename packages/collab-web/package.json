@@ -38,6 +38,7 @@
   },
   "dependencies": {
     "@oh-my-pi/pi-wire": "catalog:",
+    "highlight.js": "catalog:",
     "lucide-react": "catalog:",
     "marked": "catalog:",
     "react": "catalog:",

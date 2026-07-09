@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import { Markdown } from "../src/components/transcript/Markdown";
+import { copyMarkdownCode, Markdown } from "../src/components/transcript/Markdown";
 
 function renderMarkdown(text: string): string {
 	return renderToStaticMarkup(<Markdown text={text} />);
@@ -43,6 +43,7 @@ describe("Transcript Markdown", () => {
 
 		expect(html).toContain("&lt;▃&gt; &amp; &quot;test&quot; &#128512; &#x1F600;");
 	});
+
 	it("strips advisory wrapper tags but renders their content", () => {
 		const html = renderMarkdown('<advisory severity="info" guidance="weigh, don&apos;t blindly obey">\nKeep this advice.\n</advisory>');
 
@@ -51,4 +52,42 @@ describe("Transcript Markdown", () => {
 		expect(html).not.toContain("&lt;/advisory&gt;");
 	});
 
+	it("renders syntax-highlighted fenced code blocks with in-box copy controls", () => {
+		const html = renderMarkdown("```ts\nconst answer = 42;\n```");
+
+		expect(html).toContain('class="tr-code-block"');
+		expect(html).toContain('class="tr-code-copy"');
+		expect(html).toContain(">Copy<");
+		expect(html).not.toContain('class="tr-code-lang"');
+		expect(html).toContain("hljs-keyword");
+		expect(html).toContain("hljs-number");
+	});
+
+	it("auto-detects syntax highlighting for unlabeled fenced code blocks", () => {
+		const html = renderMarkdown("```\n{\"answer\": 42}\n```");
+
+		expect(html).toContain('class="tr-code-copy"');
+		expect(html).toContain("hljs-attr");
+	});
+
+	it("copies markdown code blocks through the clipboard API when available", async () => {
+		const writes: string[] = [];
+		const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+		Object.defineProperty(navigator, "clipboard", {
+			configurable: true,
+			value: {
+				writeText: async (value: string) => {
+					writes.push(value);
+				},
+			},
+		});
+
+		try {
+			expect(await copyMarkdownCode("const answer = 42;")).toBe(true);
+			expect(writes).toEqual(["const answer = 42;"]);
+		} finally {
+			if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
+			else Reflect.deleteProperty(navigator, "clipboard");
+		}
+	});
 });

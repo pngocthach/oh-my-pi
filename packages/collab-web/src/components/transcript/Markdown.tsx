@@ -1,6 +1,62 @@
+import hljs from "highlight.js/lib/core";
+import bash from "highlight.js/lib/languages/bash";
+import diff from "highlight.js/lib/languages/diff";
+import javascript from "highlight.js/lib/languages/javascript";
+import json from "highlight.js/lib/languages/json";
+import markdownLanguage from "highlight.js/lib/languages/markdown";
+import python from "highlight.js/lib/languages/python";
+import sql from "highlight.js/lib/languages/sql";
+import typescript from "highlight.js/lib/languages/typescript";
+import xml from "highlight.js/lib/languages/xml";
+import yaml from "highlight.js/lib/languages/yaml";
 import { Marked } from "marked";
-import type { ReactNode } from "react";
-import { memo, useMemo } from "react";
+import type { MouseEvent, ReactNode } from "react";
+import { memo, useCallback, useMemo } from "react";
+
+const REGISTERED_LANGUAGES = [
+	["bash", bash],
+	["diff", diff],
+	["javascript", javascript],
+	["json", json],
+	["markdown", markdownLanguage],
+	["python", python],
+	["sql", sql],
+	["typescript", typescript],
+	["xml", xml],
+	["yaml", yaml],
+] as const;
+
+for (const [name, language] of REGISTERED_LANGUAGES) hljs.registerLanguage(name, language);
+hljs.registerAliases(["sh", "shell", "zsh"], { languageName: "bash" });
+hljs.registerAliases(["js", "jsx", "mjs", "cjs"], { languageName: "javascript" });
+hljs.registerAliases(["ts", "tsx", "mts", "cts"], { languageName: "typescript" });
+hljs.registerAliases(["html", "svg"], { languageName: "xml" });
+hljs.registerAliases(["yml"], { languageName: "yaml" });
+hljs.registerAliases(["md", "mdx"], { languageName: "markdown" });
+
+const LANGUAGE_ALIASES = new Map<string, string>([
+	["sh", "bash"],
+	["shell", "bash"],
+	["zsh", "bash"],
+	["js", "javascript"],
+	["jsx", "javascript"],
+	["mjs", "javascript"],
+	["cjs", "javascript"],
+	["ts", "typescript"],
+	["tsx", "typescript"],
+	["mts", "typescript"],
+	["cts", "typescript"],
+	["html", "xml"],
+	["svg", "xml"],
+	["yml", "yaml"],
+	["md", "markdown"],
+	["mdx", "markdown"],
+]);
+
+interface RenderedMarkdown {
+	html: string;
+	copies: Map<string, string>;
+}
 
 function escapeHtml(s: string): string {
 	return s
@@ -15,7 +71,7 @@ function unescapeHtml(raw: string): string {
 		if (Number.isFinite(value) && value >= 0 && value <= 0x10ffff) {
 			try {
 				return String.fromCodePoint(value);
-			} catch (_) {}
+			} catch {}
 		}
 		return "";
 	};
@@ -54,33 +110,99 @@ function safeHref(href: string): string | null {
 	return trimmed; // relative / fragment
 }
 
-const md = new Marked({
-	gfm: true,
-	renderer: {
-		// Raw HTML tokens (block + inline both arrive here) are escaped, never emitted.
-		html({ text }) {
-			const cleaned = text.replace(/<\/?(?:advisory|span|text)\b(?:\s[^>]*)?\s*\/?>/gi, "");
-			if (cleaned === "") return "";
-			return escapeHtml(unescapeHtml(cleaned));
+function normalizeFenceLanguage(raw: string | null | undefined): string | null {
+	const token = raw?.trim().split(/\s+/, 1)[0]?.toLowerCase();
+	if (!token) return null;
+	const language = LANGUAGE_ALIASES.get(token) ?? token;
+	return hljs.getLanguage(language) ? language : null;
+}
+
+function highlightCodeBlock(code: string, rawLang: string | null | undefined): string {
+	const language = normalizeFenceLanguage(rawLang);
+	if (language) {
+		try {
+			return hljs.highlight(code, { language, ignoreIllegals: true }).value;
+		} catch {}
+	}
+	try {
+		const auto = hljs.highlightAuto(code);
+		if (auto.language) return auto.value;
+	} catch {}
+	return escapeHtml(code);
+}
+
+function renderCodeBlockHtml(code: string, rawLang: string | null | undefined, copyId: string): string {
+	return [
+		'<div class="tr-code-block">',
+		`<button type="button" class="tr-code-copy" data-copy-id="${copyId}" title="copy code">Copy</button>`,
+		`<pre><code class="hljs">${highlightCodeBlock(code, rawLang)}</code></pre>`,
+		"</div>",
+	].join("");
+}
+
+export async function copyMarkdownCode(text: string): Promise<boolean> {
+	const clipboard = navigator.clipboard;
+	if (!clipboard || typeof clipboard.writeText !== "function") return false;
+	try {
+		await clipboard.writeText(text);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function renderMarkdownHtml(text: string): RenderedMarkdown {
+	const copies = new Map<string, string>();
+	let copySeq = 0;
+	const md = new Marked({
+		gfm: true,
+		renderer: {
+			// Raw HTML tokens (block + inline both arrive here) are escaped, never emitted.
+			html({ text }) {
+				const cleaned = text.replace(/<\/?(?:advisory|span|text)\b(?:\s[^>]*)?\s*\/?>/gi, "");
+				if (cleaned === "") return "";
+				return escapeHtml(unescapeHtml(cleaned));
+			},
+			link({ href, title, tokens }) {
+				const inner = this.parser.parseInline(tokens);
+				const url = safeHref(href);
+				if (url === null) return inner;
+				const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+				return `<a href="${escapeHtml(url)}"${titleAttr} target="_blank" rel="noopener">${inner}</a>`;
+			},
+			code({ text, lang }) {
+				const copyId = `code-${copySeq++}`;
+				copies.set(copyId, text);
+				return renderCodeBlockHtml(text, lang, copyId);
+			},
 		},
-		link({ href, title, tokens }) {
-			const inner = this.parser.parseInline(tokens);
-			const url = safeHref(href);
-			if (url === null) return inner;
-			const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
-			return `<a href="${escapeHtml(url)}"${titleAttr} target="_blank" rel="noopener">${inner}</a>`;
-		},
-	},
-	breaks: true,
-});
+		breaks: true,
+	});
+	try {
+		return { html: md.parse(text, { async: false }), copies };
+	} catch {
+		return { html: escapeHtml(text), copies: new Map() };
+	}
+}
 
 export const Markdown = memo(function Markdown({ text }: { text: string }): ReactNode {
-	const html = useMemo(() => {
-		try {
-			return md.parse(text, { async: false });
-		} catch {
-			return escapeHtml(text);
-		}
-	}, [text]);
-	return <div className="tr-md" dangerouslySetInnerHTML={{ __html: html }} />;
+	const rendered = useMemo(() => renderMarkdownHtml(text), [text]);
+
+	const onClick = useCallback(
+		async (event: MouseEvent<HTMLDivElement>) => {
+			const target = event.target;
+			if (!(target instanceof Element)) return;
+			const button = target.closest("button[data-copy-id]");
+			if (!(button instanceof HTMLButtonElement)) return;
+			event.preventDefault();
+			const copyId = button.dataset.copyId;
+			if (!copyId) return;
+			const code = rendered.copies.get(copyId);
+			if (code === undefined) return;
+			await copyMarkdownCode(code);
+		},
+		[rendered],
+	);
+
+	return <div className="tr-md" dangerouslySetInnerHTML={{ __html: rendered.html }} onClick={onClick} />;
 });
