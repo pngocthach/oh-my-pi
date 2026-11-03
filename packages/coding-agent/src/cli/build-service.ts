@@ -1,30 +1,10 @@
 /**
- * Client for Stencil's build service, the source of omp's standalone binaries.
- *
- * `omp update` on a standalone binary install, the binary takeover of a
- * package-manager install, and the startup update check of a compiled binary
- * all ask the service which build to install ({@link fetchBuild}):
- *
- * - `GET {origin}/api/products/omp/latest/{target}?channel=stable|canary` for
- *   the newest build on a channel;
- * - `GET {origin}/api/products/omp/versions/{version}/{target}` for one exact
- *   version.
- *
- * omp is a public product, so no token is sent. The origin is `PI_BUILD_URL`
- * ({@link DEFAULT_BUILD_URL} when unset). `{target}` is
- * `{macos|linux|linux-musl|windows}-{arm64|x86_64}` ({@link resolveBuildHost}).
- * Requests carry `User-Agent: omp/<version>`, which the service counts in its
- * update-check statistics.
- *
- * Adding `from_version=<installed version>` makes the answer carry an
- * HDiffPatch patch from that version's file to the answered one when the
- * service has it; when it does not yet, the service starts making it
- * (`patch_pending`) so a later check finds it.
- *
- * An answer is checked before anything in it is used ({@link parseBuildAnswer}):
- * a malformed answer is an error, a malformed `patch` is dropped so the whole
- * file still installs. `404 {"error":"no_build"}` means nothing is published
- * for the target (on the channel, or at the version).
+ * Standalone binaries come only from pngocthach/oh-my-pi. Stable selects the
+ * newest non-prerelease; canary selects the newest published release (including
+ * prereleases). Only the first 100 GitHub releases are considered. A release
+ * is installable only when it has the expected platform binary and a
+ * SHA256SUMS.txt entry for that exact asset. GitHub releases provide whole
+ * binaries only; this updater does not offer delta patches.
  */
 import * as fs from "node:fs";
 import { $env, APP_NAME, isRecord, VERSION } from "@oh-my-pi/pi-utils";
@@ -40,25 +20,22 @@ export type UpdateChannel = "stable" | "canary";
 
 export type Fetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
-/** Build service origin used when `PI_BUILD_URL` is unset. */
-export const DEFAULT_BUILD_URL = "https://build.stencil.so";
-
-/** The product omp's builds are published under. */
-const PRODUCT = "omp";
+/** GitHub release API endpoint used when `PI_BUILD_URL` is unset. */
+export const DEFAULT_BUILD_URL = "https://api.github.com/repos/pngocthach/oh-my-pi";
 
 const BUILD_CHECK_TIMEOUT_MS = 30_000;
 
-/** Build service origin: `PI_BUILD_URL` without trailing slashes, else {@link DEFAULT_BUILD_URL}. */
+/** Fork's release API endpoint: `PI_BUILD_URL` when set, else {@link DEFAULT_BUILD_URL}. */
 export function buildServiceUrl(): string {
 	const configured = ($env.PI_BUILD_URL ?? "").trim().replace(/\/+$/, "");
 	return configured || DEFAULT_BUILD_URL;
 }
 
-/** Where this host's builds live on the build service. */
+/** Where this host's published standalone release binary lives. */
 export interface BuildHost {
-	/** Build service target, e.g. `macos-arm64` or `linux-musl-x86_64`. */
+	/** Host target, e.g. `macos-arm64` or `linux-musl-x86_64`. */
 	target: string;
-	/** Name of the target's file, the release asset name (e.g. `omp-darwin-arm64`). */
+	/** Name of the release asset (e.g. `omp-darwin-arm64`). */
 	fileName: string;
 }
 
@@ -178,7 +155,7 @@ export interface BuildAnswer {
 	patch?: BuildPatch;
 }
 
-const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 function isSize(value: unknown): value is number {
@@ -238,7 +215,7 @@ export function parseBuildAnswer(body: unknown, fileName: string, fromVersion?: 
 export type BuildSelector = { channel: UpdateChannel } | { version: string };
 
 export interface FetchBuildOptions {
-	/** Installed version to ask a patch from (`from_version`). */
+	/** Retained for caller compatibility; GitHub releases provide no delta patches. */
 	fromVersion?: string;
 	timeoutMs?: number;
 	fetchImpl?: Fetch;
@@ -246,20 +223,15 @@ export interface FetchBuildOptions {
 	host?: BuildHost;
 }
 
-/** Ask the build service for a build of this host's target ({@link BuildSelector}). */
+/** Ask the fork's GitHub releases for this host's checked standalone binary. */
 export async function fetchBuild(selector: BuildSelector, options: FetchBuildOptions = {}): Promise<BuildAnswer> {
 	const host = options.host ?? (await currentBuildHost());
 	const origin = buildServiceUrl();
 	const timeoutMs = options.timeoutMs ?? BUILD_CHECK_TIMEOUT_MS;
-	const route =
-		"channel" in selector
-			? `latest/${host.target}`
-			: `versions/${encodeURIComponent(selector.version)}/${host.target}`;
-	const url = new URL(`${origin}/api/products/${PRODUCT}/${route}`);
-	if ("channel" in selector) url.searchParams.set("channel", selector.channel);
-	if (options.fromVersion) url.searchParams.set("from_version", options.fromVersion);
+	const fetchImpl = options.fetchImpl ?? fetch;
 	const what = `${APP_NAME} ${"channel" in selector ? `${selector.channel} build` : `build ${selector.version}`} for ${host.target}`;
-
+	const signal = withTimeoutSignal(timeoutMs);
+	const headers = { Accept: "application/vnd.github+json", "User-Agent": `${APP_NAME}/${VERSION}` };
 	const mapError = (err: unknown): unknown => {
 		if (isTimeoutError(err)) {
 			return new Error(`Timed out asking ${origin} for the ${what} after ${Math.round(timeoutMs / 1000)}s`, {
@@ -270,34 +242,75 @@ export async function fetchBuild(selector: BuildSelector, options: FetchBuildOpt
 		return err;
 	};
 
-	let response: Response;
-	let body: unknown;
+	const repositoryPath = new URL(DEFAULT_BUILD_URL).pathname;
+	if (new URL(origin).pathname !== repositoryPath) {
+		throw new Error(`Standalone releases must come from pngocthach/oh-my-pi; invalid release endpoint ${origin}`);
+	}
+
+	let releasesResponse: Response;
+	let releases: unknown;
 	try {
-		response = await (options.fetchImpl ?? fetch)(url, {
-			headers: { Accept: "application/json", "User-Agent": `${APP_NAME}/${VERSION}` },
-			signal: withTimeoutSignal(timeoutMs),
-		});
-		try {
-			body = await response.json();
-		} catch (err) {
-			// A malformed body is reported below; body-read timeouts and resets surface.
-			if (!(err instanceof SyntaxError)) throw err;
-		}
+		const url = new URL(`${origin}/releases`);
+		url.searchParams.set("per_page", "100");
+		releasesResponse = await fetchImpl(url, { headers, signal });
+		releases = await releasesResponse.json();
 	} catch (err) {
 		throw mapError(err);
 	}
+	if (!releasesResponse.ok) {
+		throw new Error(`${origin} answered ${releasesResponse.status} ${releasesResponse.statusText} for the ${what}`);
+	}
+	if (!Array.isArray(releases)) throw new Error(`Invalid GitHub release list from ${origin}`);
 
-	if (response.status === 404 && isRecord(body) && body.error === "no_build") {
-		const hint =
-			"channel" in selector && selector.channel === "canary" ? ` Try \`${APP_NAME} update --stable\`.` : "";
-		throw new Error(`No ${what} is published on ${origin} yet.${hint}`);
+	const validReleases = releases.filter(
+		(release): release is Record<string, unknown> =>
+			isRecord(release) && release.draft !== true && typeof release.tag_name === "string",
+	);
+	const release =
+		"version" in selector
+			? validReleases.find(item => item.tag_name === selector.version || item.tag_name === `v${selector.version}`)
+			: validReleases.find(item => selector.channel === "canary" || item.prerelease !== true);
+	if (!release) throw new Error(`No ${what} is published by pngocthach/oh-my-pi yet.`);
+	const tag = release.tag_name as string;
+	const version = tag.startsWith("v") ? tag.slice(1) : tag;
+	if (!SEMVER.test(version)) throw new Error(`Invalid release tag ${tag} from ${origin}`);
+	if (!Array.isArray(release.assets)) throw new Error(`Release ${tag} from ${origin} has no assets`);
+	const assets = release.assets.filter(
+		(asset): asset is Record<string, unknown> => isRecord(asset) && typeof asset.name === "string",
+	);
+	const binary = assets.find(asset => asset.name === host.fileName);
+	const sums = assets.find(asset => asset.name === "SHA256SUMS.txt");
+	if (
+		!binary ||
+		!sums ||
+		!isSize(binary.size) ||
+		!isHttpsUrl(binary.browser_download_url) ||
+		!isHttpsUrl(sums.browser_download_url)
+	) {
+		throw new Error(`Release ${tag} from pngocthach/oh-my-pi is missing ${host.fileName} or SHA256SUMS.txt`);
 	}
-	if (!response.ok) {
-		throw new Error(`${origin} answered ${response.status} ${response.statusText} for the ${what}`);
-	}
+
+	let sumsResponse: Response;
+	let sumsText: string;
 	try {
-		return parseBuildAnswer(body, host.fileName, options.fromVersion);
+		sumsResponse = await fetchImpl(sums.browser_download_url, {
+			headers: { Accept: "text/plain", "User-Agent": `${APP_NAME}/${VERSION}` },
+			signal,
+		});
+		sumsText = await sumsResponse.text();
 	} catch (err) {
-		throw new Error(`Invalid answer from ${origin} for the ${what}: ${err instanceof Error ? err.message : err}`);
+		throw mapError(err);
 	}
+	if (!sumsResponse.ok) {
+		throw new Error(`Could not read SHA256SUMS.txt for release ${tag}: ${sumsResponse.status} ${sumsResponse.statusText}`);
+	}
+	const escapedName = host.fileName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const checksum = new RegExp(`^([0-9a-f]{64}) [ *]${escapedName}$`, "m").exec(sumsText)?.[1];
+	if (!checksum) throw new Error(`SHA256SUMS.txt for release ${tag} has no valid checksum for ${host.fileName}`);
+	return {
+		version,
+		file: { name: host.fileName, size: binary.size, sha256: checksum },
+		download: binary.browser_download_url,
+		patch: undefined,
+	};
 }

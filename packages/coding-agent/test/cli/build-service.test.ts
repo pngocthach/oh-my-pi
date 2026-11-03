@@ -118,65 +118,94 @@ describe("build service targets", () => {
 describe("fetchBuild", () => {
 	const host: BuildHost = { target: "macos-arm64", fileName };
 	const previousUrl = process.env.PI_BUILD_URL;
+	const checksum = sha("fork release binary");
+	const release = (tag: string, flags: Record<string, unknown> = {}) => ({
+		tag_name: tag,
+		draft: false,
+		prerelease: false,
+		...flags,
+		assets: [
+			{ name: fileName, size: 1234, browser_download_url: `https://release.test/${tag}/${fileName}` },
+			{
+				name: "SHA256SUMS.txt",
+				size: 80,
+				browser_download_url: `https://release.test/${tag}/SHA256SUMS.txt`,
+			},
+		],
+	});
+	const fetchReleases =
+		(releases: unknown[], sumsText = `${checksum}  ${fileName}\n`) =>
+		async (input: string | URL | Request) => {
+			const url = String(input);
+			if (url.endsWith("/releases?per_page=100")) return Response.json(releases);
+			if (url.endsWith("/SHA256SUMS.txt")) return new Response(sumsText);
+			throw new Error(`Unexpected request ${url}`);
+		};
 
 	afterEach(() => {
 		if (previousUrl === undefined) delete process.env.PI_BUILD_URL;
 		else process.env.PI_BUILD_URL = previousUrl;
 	});
 
-	it("asks the configured origin for the channel's newest build, naming the installed version", async () => {
-		process.env.PI_BUILD_URL = "https://build.test/";
-		const requests: Array<{ url: string; userAgent: string | null; signal: AbortSignal | null | undefined }> = [];
-
-		const build = await fetchBuild(
-			{ channel: "canary" },
-			{
-				host,
-				fromVersion: "18.8.8",
-				fetchImpl: async (input, init) => {
-					requests.push({
-						url: String(input),
-						userAgent: new Headers(init?.headers).get("User-Agent"),
-						signal: init?.signal,
-					});
-					return Response.json(answer());
-				},
-			},
-		);
-
-		expect(requests).toHaveLength(1);
-		expect(requests[0].url).toBe(
-			"https://build.test/api/products/omp/latest/macos-arm64?channel=canary&from_version=18.8.8",
-		);
-		expect(requests[0].userAgent).toBe(`omp/${VERSION}`);
-		expect(requests[0].signal).toBeInstanceOf(AbortSignal);
-		expect(build.patch?.fromVersion).toBe("18.8.8");
-	});
-
-	it("asks for one exact version without a channel", async () => {
+	it("uses the fork's stable GitHub release and requires its checksum asset", async () => {
 		delete process.env.PI_BUILD_URL;
-		let url = "";
-
-		await fetchBuild(
-			{ version: "18.8.9" },
+		const requests: string[] = [];
+		const build = await fetchBuild(
+			{ channel: "stable" },
 			{
 				host,
 				fetchImpl: async input => {
-					url = String(input);
-					return Response.json(answer());
+					requests.push(String(input));
+					return fetchReleases([release("v18.9.0", { prerelease: true }), release("v18.8.9")])(
+						input as string | URL | Request,
+					);
 				},
 			},
 		);
 
-		expect(url).toBe("https://build.stencil.so/api/products/omp/versions/18.8.9/macos-arm64");
+		expect(requests[0]).toBe("https://api.github.com/repos/pngocthach/oh-my-pi/releases?per_page=100");
+		expect(build).toEqual({
+			version: "18.8.9",
+			file: { name: fileName, size: 1234, sha256: checksum },
+			download: `https://release.test/v18.8.9/${fileName}`,
+			patch: undefined,
+		});
 	});
 
-	it("names the target when nothing is published for it", async () => {
+	it("selects the newest canary and supports exact versions", async () => {
+		process.env.PI_BUILD_URL = "https://github.test/repos/pngocthach/oh-my-pi";
+		const fetchImpl = fetchReleases([release("v18.9.0-canary.1", { prerelease: true }), release("v18.8.9")]);
+		const canary = await fetchBuild({ channel: "canary" }, { host, fetchImpl });
+		const exact = await fetchBuild({ version: "18.8.9" }, { host, fetchImpl });
+		expect(canary.version).toBe("18.9.0-canary.1");
+		expect(exact.version).toBe("18.8.9");
+	});
+
+	it("rejects a release without this platform's binary or a valid matching checksum", async () => {
 		await expect(
 			fetchBuild(
 				{ channel: "stable" },
-				{ host, fetchImpl: async () => Response.json({ error: "no_build" }, { status: 404 }) },
+				{ host, fetchImpl: fetchReleases([{ ...release("v18.8.9"), assets: [] }]) },
 			),
-		).rejects.toThrow("No omp stable build for macos-arm64 is published");
+		).rejects.toThrow("missing omp-darwin-arm64 or SHA256SUMS.txt");
+		await expect(
+			fetchBuild(
+				{ channel: "stable" },
+				{ host, fetchImpl: fetchReleases([release("v18.8.9")], `${sha("another binary")}  omp-darwin-x64\n`) },
+			),
+		).rejects.toThrow("no valid checksum for omp-darwin-arm64");
+	});
+
+	it("does not fall back to an upstream release when the fork has none", async () => {
+		await expect(fetchBuild({ channel: "stable" }, { host, fetchImpl: fetchReleases([]) })).rejects.toThrow(
+			"published by pngocthach/oh-my-pi",
+		);
+	});
+
+	it("rejects an upstream repository endpoint even when configured", async () => {
+		process.env.PI_BUILD_URL = "https://api.github.com/repos/can1357/oh-my-pi";
+		await expect(fetchBuild({ channel: "stable" }, { host, fetchImpl: fetchReleases([]) })).rejects.toThrow(
+			"Standalone releases must come from pngocthach/oh-my-pi",
+		);
 	});
 });

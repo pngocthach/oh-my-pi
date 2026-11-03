@@ -1122,7 +1122,7 @@ async function installedBuildVersion(targetPath: string): Promise<string> {
  */
 async function verifyBinaryAtPath(binaryPath: string, expectedVersion: string): Promise<InstalledVersionVerification> {
 	const actual = await reportedVersionAtPath(binaryPath);
-	return { ok: actual === expectedVersion, actual, path: binaryPath };
+	return { ok: actual === expectedVersion.split("+", 1)[0], actual, path: binaryPath };
 }
 
 async function validateExistingUpdateTarget(targetPath: string): Promise<void> {
@@ -2128,9 +2128,9 @@ interface UpdateRequest {
  * when there is nothing to install: not newer, and neither `--force` nor a
  * channel switch asks for it.
  */
-function announceOffer(version: string, request: UpdateRequest): boolean {
+function announceOffer(version: string, request: UpdateRequest, differentBuild = false): boolean {
 	const comparison = compareVersions(version, VERSION);
-	if (comparison <= 0 && !request.force && !request.isChannelSwitch) {
+	if (comparison <= 0 && !differentBuild && !request.force && !request.isChannelSwitch) {
 		const icon = theme?.status?.success ?? "✔";
 		console.log(chalk.green(`${icon} Already up to date`));
 		return false;
@@ -2141,7 +2141,7 @@ function announceOffer(version: string, request: UpdateRequest): boolean {
 				`Switching to ${request.channel} ${version}${comparison < 0 ? ` (downgrade from ${VERSION})` : ""}`,
 			),
 		);
-	} else if (comparison > 0) {
+	} else if (comparison > 0 || differentBuild) {
 		console.log(chalk.cyan(`New version available: ${version}`));
 	} else {
 		console.log(chalk.yellow(`Forcing reinstall of ${version}`));
@@ -2167,7 +2167,16 @@ async function runBinaryUpdate(
 		console.error(chalk.red(`Failed to check for updates: ${err}`));
 		process.exit(1);
 	}
-	if (!announceOffer(build.version, request) || request.check) return;
+	let differentBuild = false;
+	if (target && compareVersions(build.version, VERSION) === 0) {
+		try {
+			differentBuild = (await fileDigest(target.path)).sha256 !== build.file.sha256;
+		} catch (err) {
+			console.error(chalk.red(`Failed to verify installed binary: ${err}`));
+			process.exit(1);
+		}
+	}
+	if (!announceOffer(build.version, request, differentBuild) || request.check) return;
 
 	try {
 		if (!target) throw targetError;
