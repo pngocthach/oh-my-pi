@@ -63,47 +63,22 @@ jobs:
       - uses: bazelbuild/setup-bazelisk@v3
         if: steps.release_check.outputs.exists != 'true'
 
-      # The standalone compiler embeds the stamped, version-matched native
-      # addons. Build the exact non-musl set used by the upstream release job;
-      # musl binaries deliberately embed the corresponding Linux native addons.
-      - name: Build native addons for standalone binaries
+      - name: Build Linux x64 native addon
         if: steps.release_check.outputs.exists != 'true'
-        run: |
-          set -euo pipefail
-          for target in \
-            linux-x64-baseline linux-x64-modern \
-            linux-arm64 darwin-x64-baseline darwin-arm64 \
-            win32-x64-baseline win32-arm64; do
-            bun scripts/bazel-natives.ts "$target" --dest packages/natives/native
-          done
+        run: bun scripts/bazel-natives.ts linux-x64-baseline --dest packages/natives/native
 
-      # This is the repository's canonical standalone binary builder. It emits
       - name: Build standalone release binaries
         if: steps.release_check.outputs.exists != 'true'
-        run: bun run ci:release:build-binaries
+        run: RELEASE_TARGETS=linux-x64 bun run ci:release:build-binaries
 
       - name: Verify asset set and write SHA256SUMS.txt
         if: steps.release_check.outputs.exists != 'true'
         shell: bash
         run: |
           set -euo pipefail
-          expected=(
-            omp-darwin-arm64
-            omp-darwin-x64
-            omp-linux-arm64
-            omp-linux-musl-arm64
-            omp-linux-musl-x64
-            omp-linux-x64
-            omp-windows-arm64.exe
-            omp-windows-x64.exe
-          )
-          assets=()
-          for name in "${expected[@]}"; do
-            file="packages/coding-agent/binaries/$name"
-            test -s "$file" || { echo "Missing or empty standalone release asset: $file" >&2; exit 1; }
-            assets+=("$file")
-          done
-          bun run ci:release:checksums SHA256SUMS.txt "${assets[@]}"
+          file="packages/coding-agent/binaries/omp-linux-x64"
+          test -s "$file"
+          bun run ci:release:checksums SHA256SUMS.txt "$file"
       - name: Publish rebased source tag only
         if: steps.release_check.outputs.exists != 'true'
         env:
@@ -137,12 +112,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "Oh My Pi $UPSTREAM_TAG (ACP MCP)" \
             --notes "Standalone fork build based on upstream release $UPSTREAM_TAG with the ACP ambient MCP patch replayed from fork/acp-ambient-mcp. See SHA256SUMS.txt to verify binary assets." \
-            packages/coding-agent/binaries/omp-darwin-arm64 \
-            packages/coding-agent/binaries/omp-darwin-x64 \
-            packages/coding-agent/binaries/omp-linux-arm64 \
-            packages/coding-agent/binaries/omp-linux-musl-arm64 \
-            packages/coding-agent/binaries/omp-linux-musl-x64 \
             packages/coding-agent/binaries/omp-linux-x64 \
-            packages/coding-agent/binaries/omp-windows-arm64.exe \
-            packages/coding-agent/binaries/omp-windows-x64.exe \
             SHA256SUMS.txt
