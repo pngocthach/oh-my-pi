@@ -48,7 +48,7 @@ if [[ -z "$patch_id" ]]; then
   echo "Could not derive a stable patch identifier for $fork_branch" >&2
   exit 1
 fi
-release_tag="${upstream_tag}+acp.${short_patch_id}"
+release_tag="${upstream_tag}+acp.${patch_id:0:12}"
 {
   echo "upstream_tag=$upstream_tag"
   echo "commit=$commit"
