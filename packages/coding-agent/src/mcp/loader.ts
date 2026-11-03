@@ -31,6 +31,8 @@ export interface MCPToolsLoadOptions {
 	onStatus?: (event: McpConnectionStatusEvent) => void;
 	/** Initial non-blocking discovery window in milliseconds (environment override wins). */
 	startupTimeoutMs?: number;
+	/** Called for each warning produced by native MCP configuration discovery. */
+	onConfigWarning?: (warning: string) => void;
 	/** Whether to load project-level config (default: true) */
 	enableProjectConfig?: boolean;
 	/** Whether to filter out Exa MCP servers (default: true) */
@@ -73,6 +75,7 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 		result = await manager.discoverAndConnect({
 			onStatus: options?.onStatus,
 			startupTimeoutMs: options?.startupTimeoutMs,
+			onConfigWarning: options?.onConfigWarning,
 			enableProjectConfig: options?.enableProjectConfig,
 			filterExa: options?.filterExa,
 			filterBrowser: options?.filterBrowser,

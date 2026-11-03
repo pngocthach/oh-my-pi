@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `OMP_ACP_AMBIENT_MCP=1` enables configured MCP servers alongside client-supplied servers in ACP sessions, with client names taking precedence (adapted from [#8548](https://github.com/can1357/oh-my-pi/pull/8548)).
+
 ## [18.16.0] - 2026-11-02
 
 ### Added

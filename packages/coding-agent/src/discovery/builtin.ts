@@ -129,7 +129,11 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 	const parseMcpServers = (content: string, path: string, level: "user" | "project"): MCPServer[] => {
 		const result: MCPServer[] = [];
 		const data = tryParseJson<{ mcpServers?: Record<string, unknown> }>(content);
-		if (!data?.mcpServers) return result;
+		if (!data) {
+			warnings.push(`Invalid JSON in ${path}`);
+			return result;
+		}
+		if (!data.mcpServers) return result;
 
 		const expanded = expandEnvVarsDeep(data.mcpServers);
 		for (const [serverName, config] of Object.entries(expanded)) {

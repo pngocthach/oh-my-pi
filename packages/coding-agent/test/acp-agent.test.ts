@@ -15,6 +15,7 @@ import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensi
 import { buildSkillPromptMessage } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import * as oauthFlowModule from "@oh-my-pi/pi-coding-agent/mcp/oauth-flow";
+import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import {
 	ACP_BOOTSTRAP_RACE_GUARD_MS,
 	AcpAgent,
@@ -689,6 +690,14 @@ describe("ACP agent", () => {
 		await harness.agent.loadSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] });
 		expect(harness.sessions.at(-1)?.sessionId).toBe(continued);
 		await harness.agent.dispose();
+	});
+
+	it("advertises versioned ambient MCP discovery support", async () => {
+		const harness = await createHarness();
+		const initialized = await harness.agent.initialize({ protocolVersion: 1 });
+		expect(initialized.agentCapabilities?._meta).toMatchObject({
+			"omp.sh/ambient-mcp-discovery": { version: 1 },
+		});
 	});
 
 	it("supports multiple live ACP sessions with model and lifecycle handlers", async () => {
@@ -4216,6 +4225,317 @@ describe("ACP agent MCP server configuration (late-connecting servers)", () => {
 	 * `onToolsChanged` -> `refreshMCPTools` follow-up now runs through a
 	 * `refreshChain` queue so late connections still land in the session.
 	 */
+	it("discovers ambient servers only when the session boundary opts in", async () => {
+		const harness = await createHarness();
+		const refreshSpy = spyOn(FakeAgentSession.prototype, "refreshMCPTools");
+		const namesOf = (tools: unknown[]) => (tools as Array<{ name: string }>).map(tool => tool.name);
+		await fs.promises.mkdir(path.join(harness.cwdA, ".omp"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(harness.cwdA, ".omp", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					ambient: { command: BUN_EXEC, args: [FIXTURE_PATH] },
+				},
+			}),
+		);
+
+		try {
+			await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			await Bun.sleep(600);
+			expect(refreshSpy.mock.calls.flatMap(call => namesOf(call[0] ?? []))).not.toContain(
+				`mcp__ambient_${DELAYED_MCP_TOOL_NAME}`,
+			);
+
+			await harness.agent.newSession({
+				cwd: harness.cwdA,
+				mcpServers: [],
+				_meta: {
+					"omp.sh/ambient-mcp-discovery": { enabled: true, reservedServerNames: ["t3-code"] },
+				},
+			});
+			await pollUntil(() =>
+				refreshSpy.mock.calls.some(call =>
+					namesOf(call[0] ?? []).includes(`mcp__ambient_${DELAYED_MCP_TOOL_NAME}`),
+				),
+			);
+		} finally {
+			await harness.agent.dispose();
+			refreshSpy.mockRestore();
+		}
+	}, 15_000);
+
+	it("keeps ambient tools when a client server is added", async () => {
+		const harness = await createHarness();
+		const refreshSpy = spyOn(FakeAgentSession.prototype, "refreshMCPTools");
+		const namesOf = (tools: unknown[]) => (tools as Array<{ name: string }>).map(tool => tool.name);
+		const fixturePath = path.join(import.meta.dir, "fixtures", "instructions-mcp.ts");
+		await fs.promises.mkdir(path.join(harness.cwdA, ".omp"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(harness.cwdA, ".omp", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					ambient: { command: BUN_EXEC, args: [fixturePath] },
+				},
+			}),
+		);
+
+		try {
+			await harness.agent.newSession({
+				cwd: harness.cwdA,
+				mcpServers: [{ name: "client", command: BUN_EXEC, args: [fixturePath], env: [] }],
+				_meta: {
+					"omp.sh/ambient-mcp-discovery": { enabled: true, reservedServerNames: ["t3-code"] },
+				},
+			});
+			const latestTools = namesOf(refreshSpy.mock.calls.at(-1)?.[0] ?? []);
+			expect(latestTools).toContain("mcp__ambient_do_thing");
+			expect(latestTools).toContain("mcp__client_do_thing");
+		} finally {
+			await harness.agent.dispose();
+			refreshSpy.mockRestore();
+		}
+	}, 15_000);
+
+	it("lets a client server replace a failing ambient server with the same name", async () => {
+		const harness = await createHarness();
+		const refreshSpy = spyOn(FakeAgentSession.prototype, "refreshMCPTools");
+		const namesOf = (tools: unknown[]) => (tools as Array<{ name: string }>).map(tool => tool.name);
+		await fs.promises.mkdir(path.join(harness.cwdA, ".omp"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(harness.cwdA, ".omp", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					overlay: { command: path.join(harness.cwdA, "missing-ambient-command") },
+				},
+			}),
+		);
+
+		try {
+			const created = await harness.agent.newSession({
+				cwd: harness.cwdA,
+				mcpServers: [{ name: "overlay", command: BUN_EXEC, args: [FIXTURE_PATH], env: [] }],
+				_meta: {
+					"omp.sh/ambient-mcp-discovery": { enabled: true, reservedServerNames: ["t3-code"] },
+				},
+			});
+			await pollUntil(() =>
+				refreshSpy.mock.calls.some(call =>
+					namesOf(call[0] ?? []).includes(`mcp__overlay_${DELAYED_MCP_TOOL_NAME}`),
+				),
+			);
+			const session = harness.findSession(created.sessionId);
+			const diagnostic = session?.sessionManager
+				.getBranch()
+				.find(
+					entry =>
+						entry.type === "custom_message" &&
+						entry.customType === "ambient-mcp-diagnostic" &&
+						typeof entry.details === "object" &&
+						entry.details !== null &&
+						Reflect.get(entry.details, "serverName") === "overlay",
+				);
+			expect(diagnostic).toMatchObject({
+				content: "",
+				display: false,
+				details: { scope: "ambient", phase: "connection", serverName: "overlay" },
+			});
+		} finally {
+			await harness.agent.dispose();
+			refreshSpy.mockRestore();
+		}
+	}, 15_000);
+
+	it("records a redacted durable diagnostic for invalid ambient configuration", async () => {
+		const harness = await createHarness();
+		await fs.promises.mkdir(path.join(harness.cwdA, ".omp"), { recursive: true });
+		await fs.promises.writeFile(path.join(harness.cwdA, ".omp", "mcp.json"), "{");
+
+		try {
+			const created = await harness.agent.newSession({
+				cwd: harness.cwdA,
+				mcpServers: [],
+				_meta: {
+					"omp.sh/ambient-mcp-discovery": { enabled: true, reservedServerNames: ["t3-code"] },
+				},
+			});
+			const session = harness.findSession(created.sessionId);
+			const diagnostic = session?.sessionManager
+				.getBranch()
+				.find(
+					entry =>
+						entry.type === "custom_message" &&
+						entry.customType === "ambient-mcp-diagnostic" &&
+						typeof entry.details === "object" &&
+						entry.details !== null &&
+						Reflect.get(entry.details, "phase") === "configuration",
+				);
+			expect(diagnostic).toMatchObject({
+				content: "",
+				display: false,
+				details: { scope: "ambient", phase: "configuration" },
+			});
+			if (diagnostic?.type !== "custom_message") throw new Error("Expected ambient MCP diagnostic");
+			expect(diagnostic.details).not.toHaveProperty("error");
+		} finally {
+			await harness.agent.dispose();
+		}
+	}, 15_000);
+
+	it("records a durable diagnostic when an ambient server fails after the startup race", async () => {
+		const harness = await createHarness();
+		await fs.promises.mkdir(path.join(harness.cwdA, ".omp"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(harness.cwdA, ".omp", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					ambient: {
+						command: BUN_EXEC,
+						args: [FIXTURE_PATH],
+						env: { MCP_TEST_TOOLS_LIST_FAILURE: "1" },
+					},
+				},
+			}),
+		);
+
+		try {
+			const created = await harness.agent.newSession({
+				cwd: harness.cwdA,
+				mcpServers: [],
+				_meta: {
+					"omp.sh/ambient-mcp-discovery": { enabled: true, reservedServerNames: ["t3-code"] },
+				},
+			});
+			const session = harness.findSession(created.sessionId);
+			if (!session) throw new Error("Expected created session");
+			const isAmbientFailure = (entry: ReturnType<typeof session.sessionManager.getBranch>[number]) =>
+				entry.type === "custom_message" &&
+				entry.customType === "ambient-mcp-diagnostic" &&
+				typeof entry.details === "object" &&
+				entry.details !== null &&
+				Reflect.get(entry.details, "serverName") === "ambient";
+			await pollUntil(() => session.sessionManager.getBranch().some(isAmbientFailure));
+			const diagnostic = session.sessionManager.getBranch().find(isAmbientFailure);
+			expect(diagnostic).toMatchObject({
+				content: "",
+				display: false,
+				details: { scope: "ambient", phase: "connection", serverName: "ambient" },
+			});
+		} finally {
+			await harness.agent.dispose();
+		}
+	}, 15_000);
+
+	it("blocks startup when the reserved client bridge cannot connect", async () => {
+		const harness = await createHarness();
+		await expect(
+			harness.agent.newSession({
+				cwd: harness.cwdA,
+				mcpServers: [
+					{
+						name: "t3-code",
+						command: path.join(harness.cwdA, "missing-t3-bridge"),
+						args: [],
+						env: [],
+					},
+				],
+				_meta: {
+					"omp.sh/ambient-mcp-discovery": {
+						enabled: true,
+						reservedServerNames: ["t3-code"],
+					},
+				},
+			}),
+		).rejects.toThrow(/t3-code/);
+	});
+
+	it("blocks startup when the reserved client bridge fails to load its tools", async () => {
+		const harness = await createHarness();
+		await expect(
+			harness.agent.newSession({
+				cwd: harness.cwdA,
+				mcpServers: [
+					{
+						name: "t3-code",
+						command: BUN_EXEC,
+						args: [FIXTURE_PATH],
+						env: [{ name: "MCP_TEST_TOOLS_LIST_FAILURE", value: "1" }],
+					},
+				],
+				_meta: {
+					"omp.sh/ambient-mcp-discovery": {
+						enabled: true,
+						reservedServerNames: ["t3-code"],
+					},
+				},
+			}),
+		).rejects.toThrow(/t3-code/);
+	}, 15_000);
+
+	it("disposes ambient servers when reserved-name cleanup fails", async () => {
+		const harness = await createHarness();
+		const originalDisconnectServer = MCPManager.prototype.disconnectServer;
+		const disconnectServerSpy = spyOn(MCPManager.prototype, "disconnectServer").mockImplementation(function (
+			this: MCPManager,
+			name,
+		) {
+			if (name === "t3-code") return Promise.reject(new Error("reserved cleanup failed"));
+			return originalDisconnectServer.call(this, name);
+		});
+		const disconnectAllSpy = spyOn(MCPManager.prototype, "disconnectAll");
+
+		try {
+			await expect(
+				harness.agent.newSession({
+					cwd: harness.cwdA,
+					mcpServers: [],
+					_meta: {
+						"omp.sh/ambient-mcp-discovery": {
+							enabled: true,
+							reservedServerNames: ["t3-code"],
+						},
+					},
+				}),
+			).rejects.toThrow("reserved cleanup failed");
+			expect(disconnectAllSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			disconnectAllSpy.mockRestore();
+			disconnectServerSpy.mockRestore();
+			await harness.agent.dispose();
+		}
+	}, 15_000);
+
+	it("keeps reserved ambient server names unavailable without a client bridge", async () => {
+		const harness = await createHarness();
+		const refreshSpy = spyOn(FakeAgentSession.prototype, "refreshMCPTools");
+		const namesOf = (tools: unknown[]) => (tools as Array<{ name: string }>).map(tool => tool.name);
+		await fs.promises.mkdir(path.join(harness.cwdA, ".omp"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(harness.cwdA, ".omp", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					"t3-code": { command: BUN_EXEC, args: [FIXTURE_PATH] },
+				},
+			}),
+		);
+
+		try {
+			await harness.agent.newSession({
+				cwd: harness.cwdA,
+				mcpServers: [],
+				_meta: {
+					"omp.sh/ambient-mcp-discovery": { enabled: true, reservedServerNames: ["t3-code"] },
+				},
+			});
+			await Bun.sleep(700);
+			expect(refreshSpy.mock.calls.flatMap(call => namesOf(call[0] ?? []))).not.toContain(
+				`mcp__t3-code_${DELAYED_MCP_TOOL_NAME}`,
+			);
+		} finally {
+			await harness.agent.dispose();
+			refreshSpy.mockRestore();
+		}
+	}, 15_000);
+
 	it("delivers a late-connecting server's tools via a queued refreshMCPTools call", async () => {
 		const harness = await createHarness();
 		const refreshSpy = spyOn(FakeAgentSession.prototype, "refreshMCPTools");
@@ -4240,6 +4560,7 @@ describe("ACP agent MCP server configuration (late-connecting servers)", () => {
 			await pollUntil(() => refreshSpy.mock.calls.length > 1);
 			expect(namesOf(refreshSpy.mock.calls.at(-1)?.[0] ?? [])).toEqual([`mcp__delayed_${DELAYED_MCP_TOOL_NAME}`]);
 		} finally {
+			await harness.agent.dispose();
 			refreshSpy.mockRestore();
 		}
 	}, 15_000);

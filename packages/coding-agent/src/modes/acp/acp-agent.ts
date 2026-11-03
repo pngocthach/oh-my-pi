@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { AgentBusyError, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
-import { getAgentDir, getBlobsDir, isEnoent, logger, type postmortem, VERSION } from "@oh-my-pi/pi-utils";
+import { getAgentDir, getBlobsDir, isEnoent, logger, type postmortem, VERSION, withTimeout } from "@oh-my-pi/pi-utils";
 import {
 	type Agent,
 	type AgentSideConnection,
@@ -57,8 +57,12 @@ import { runExtensionCompact } from "../../extensibility/extensions/compact-hand
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import { parseSkillInvocation } from "../../extensibility/skills";
 import { PYTHON_KERNEL_CANCEL_BUDGET_MS } from "../../eval/py/kernel";
+import { discoverAndLoadMCPTools } from "../../mcp/loader";
 import { MCPManager } from "../../mcp/manager";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
+import { cfgMcpEnableProjectConfig, cfgMcpNotifications } from "../../mcp/settings";
+import { cfgBrowserEnabled } from "../../tools/browser/settings";
+import { describeMCPTimeout, isMCPTimeoutEnabled, resolveMCPTimeoutMs } from "../../mcp/timeout";
 import type { MCPServerConfig } from "../../mcp/types";
 import { loadAllExtensions } from "../../modes/components/extensions/state-manager";
 import { theme } from "@oh-my-pi/pi-tui/theme";
@@ -134,6 +138,27 @@ export const ACP_BOOTSTRAP_RACE_GUARD_MS = 50;
 const ACP_CANCEL_CLEANUP_TIMEOUT_MS = PYTHON_KERNEL_CANCEL_BUDGET_MS + 1_000;
 const ACP_ASYNC_DELIVERY_DRAIN_TIMEOUT_MS = 250;
 const ACP_ASYNC_DELIVERY_DRAIN_MAX_PASSES = 3;
+const AMBIENT_MCP_DISCOVERY_META_KEY = "omp.sh/ambient-mcp-discovery";
+const AMBIENT_MCP_DISCOVERY_VERSION = 1;
+const AMBIENT_MCP_DIAGNOSTIC_TYPE = "ambient-mcp-diagnostic";
+
+type AmbientMcpDiscoveryOptions = {
+	readonly reservedServerNames: ReadonlySet<string>;
+};
+
+function ambientMcpDiscoveryOptions(meta: NewSessionRequest["_meta"]): AmbientMcpDiscoveryOptions | undefined {
+	if (process.env.OMP_ACP_AMBIENT_MCP === "1") return { reservedServerNames: new Set(["t3-code"]) };
+	const request = meta?.[AMBIENT_MCP_DISCOVERY_META_KEY];
+	if (typeof request !== "object" || request === null || Array.isArray(request)) return undefined;
+	if (Reflect.get(request, "enabled") !== true) return undefined;
+	const rawReservedNames = Reflect.get(request, "reservedServerNames");
+	const reservedServerNames = new Set(
+		Array.isArray(rawReservedNames)
+			? rawReservedNames.filter((name): name is string => typeof name === "string" && name.length > 0)
+			: [],
+	);
+	return { reservedServerNames };
+}
 
 /**
  * `<agentDir>/acp-session-handles.json` maps ACP handles whose durable session an
@@ -861,6 +886,9 @@ export class AcpAgent implements Agent {
 			},
 			authMethods,
 			agentCapabilities: {
+				_meta: {
+					[AMBIENT_MCP_DISCOVERY_META_KEY]: { version: AMBIENT_MCP_DISCOVERY_VERSION },
+				},
 				loadSession: true,
 				mcpCapabilities: {
 					http: true,
@@ -900,7 +928,11 @@ export class AcpAgent implements Agent {
 
 	async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
 		this.#assertAbsoluteCwd(params.cwd);
-		const record = await this.#createNewSessionRecord(params.cwd, params.mcpServers);
+		const record = await this.#createNewSessionRecord(
+			params.cwd,
+			params.mcpServers,
+			ambientMcpDiscoveryOptions(params._meta),
+		);
 		const response: NewSessionResponse = {
 			sessionId: record.protocolSessionId,
 			configOptions: this.#buildConfigOptions(record.session),
@@ -912,7 +944,12 @@ export class AcpAgent implements Agent {
 
 	async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
 		this.#assertAbsoluteCwd(params.cwd);
-		const record = await this.#loadManagedSession(params.sessionId, params.cwd, params.mcpServers);
+		const record = await this.#loadManagedSession(
+			params.sessionId,
+			params.cwd,
+			params.mcpServers,
+			ambientMcpDiscoveryOptions(params._meta),
+		);
 		await this.#replaySessionHistory(record);
 		const response: LoadSessionResponse = {
 			configOptions: this.#buildConfigOptions(record.session),
@@ -941,7 +978,12 @@ export class AcpAgent implements Agent {
 
 	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
 		this.#assertAbsoluteCwd(params.cwd);
-		const record = await this.#resumeManagedSession(params.sessionId, params.cwd, params.mcpServers ?? []);
+		const record = await this.#resumeManagedSession(
+			params.sessionId,
+			params.cwd,
+			params.mcpServers ?? [],
+			ambientMcpDiscoveryOptions(params._meta),
+		);
 		const response: ResumeSessionResponse = {
 			configOptions: this.#buildConfigOptions(record.session),
 			modes: this.#buildModeState(record.session),
@@ -1618,7 +1660,11 @@ export class AcpAgent implements Agent {
 		);
 	}
 
-	async #createNewSessionRecord(cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
+	async #createNewSessionRecord(
+		cwd: string,
+		mcpServers: McpServer[],
+		ambientDiscovery: AmbientMcpDiscoveryOptions | undefined,
+	): Promise<ManagedSessionRecord> {
 		const { session, setToolUIContext } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
@@ -1630,31 +1676,41 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext);
+		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, ambientDiscovery);
 	}
 
-	async #loadManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
+	async #loadManagedSession(
+		sessionId: string,
+		cwd: string,
+		mcpServers: McpServer[],
+		ambientDiscovery: AmbientMcpDiscoveryOptions | undefined,
+	): Promise<ManagedSessionRecord> {
 		const existing = this.#sessions.get(sessionId);
 		if (existing) {
 			this.#assertMatchingCwd(existing.session, cwd);
-			await this.#configureMcpServers(existing, mcpServers);
+			await this.#configureMcpServers(existing, mcpServers, ambientDiscovery);
 			return existing;
 		}
 
 		const storedSession = await this.#findHandleSession(sessionId, cwd);
-		return await this.#openStoredSession(storedSession.path, cwd, mcpServers, sessionId);
+		return await this.#openStoredSession(storedSession.path, cwd, mcpServers, sessionId, ambientDiscovery);
 	}
 
-	async #resumeManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
+	async #resumeManagedSession(
+		sessionId: string,
+		cwd: string,
+		mcpServers: McpServer[],
+		ambientDiscovery: AmbientMcpDiscoveryOptions | undefined,
+	): Promise<ManagedSessionRecord> {
 		const existing = this.#sessions.get(sessionId);
 		if (existing) {
 			this.#assertMatchingCwd(existing.session, cwd);
-			await this.#configureMcpServers(existing, mcpServers);
+			await this.#configureMcpServers(existing, mcpServers, ambientDiscovery);
 			return existing;
 		}
 
 		const storedSession = await this.#findHandleSession(sessionId, cwd);
-		return await this.#openStoredSession(storedSession.path, cwd, mcpServers, sessionId);
+		return await this.#openStoredSession(storedSession.path, cwd, mcpServers, sessionId, ambientDiscovery);
 	}
 
 	/** The stored session behind `handle`: the session an extension moved it to, else the handle's own. */
@@ -1703,7 +1759,7 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext);
+		return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext, ambientMcpDiscoveryOptions(params._meta));
 	}
 
 	async #openStoredSession(
@@ -1711,6 +1767,7 @@ export class AcpAgent implements Agent {
 		cwd: string,
 		mcpServers: McpServer[],
 		protocolSessionId: string,
+		ambientDiscovery: AmbientMcpDiscoveryOptions | undefined,
 	): Promise<ManagedSessionRecord> {
 		const { session, setToolUIContext } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(cwd), {
@@ -1726,24 +1783,19 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, protocolSessionId);
+		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, ambientDiscovery, protocolSessionId);
 	}
 
 	async #registerPreparedSession(
 		session: AgentSession,
 		mcpServers: McpServer[],
 		setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined,
+		ambientDiscovery: AmbientMcpDiscoveryOptions | undefined,
 		protocolSessionId = session.sessionId,
 	): Promise<ManagedSessionRecord> {
 		const record = this.#createManagedSessionRecord(session, setToolUIContext, protocolSessionId);
-		// Registered before extensions start: a `session_start` handler can already replace the durable session.
 		session.registerSessionChangeCallback(() => this.#rememberHandleSession(record));
-		session.setClientBridge(
-			createAcpClientBridge(this.#connection, record.protocolSessionId, this.#clientCapabilities),
-		);
-		// Client-declared servers live in `record.mcpManager`, not the session's
-		// own (ACP sessions run with `enableMCP: false`); read it live so every
-		// reconfiguration's `refreshMCPTools` rebuild renders its instructions.
+		session.setClientBridge(createAcpClientBridge(this.#connection, record.protocolSessionId, this.#clientCapabilities));
 		session.setMcpServerInstructionsSource(() => record.mcpManager?.getServerInstructions());
 		try {
 			const unsubscribeEvents = session.subscribe(event => {
@@ -1751,7 +1803,7 @@ export class AcpAgent implements Agent {
 			});
 			record.lifetimeUnsubscribe = unsubscribeEvents;
 			await this.#configureExtensions(record);
-			await this.#configureMcpServers(record, mcpServers);
+			await this.#configureMcpServers(record, mcpServers, ambientDiscovery);
 			this.#sessions.set(record.protocolSessionId, record);
 			return record;
 		} catch (error) {
@@ -3145,7 +3197,29 @@ export class AcpAgent implements Agent {
 		record.extensionsConfigured = true;
 	}
 
-	async #configureMcpServers(record: ManagedSessionRecord, servers: McpServer[]): Promise<void> {
+	/**
+	 * `failedName === undefined` means the `.mcp.json` config itself failed to
+	 * parse (phase "configuration"); a string is the server whose connection
+	 * failed. A dedicated undefined case — not a name sentinel — because dots
+	 * pass the sanitizer, so ".mcp.json" is a legal server name.
+	 */
+	#recordAmbientMcpDiagnostic(record: ManagedSessionRecord, failedName: string | undefined): void {
+		const phase = failedName === undefined ? "configuration" : "connection";
+		const serverName = failedName?.replace(/[^a-zA-Z0-9_.:-]/g, "?").slice(0, 128);
+		const details = {
+			scope: "ambient",
+			phase,
+			...(serverName ? { serverName } : {}),
+		};
+		record.session.sessionManager.appendCustomMessageEntry(AMBIENT_MCP_DIAGNOSTIC_TYPE, undefined, false, details);
+		logger.warn("Ambient MCP setup failed", details);
+	}
+
+	async #configureMcpServers(
+		record: ManagedSessionRecord,
+		servers: McpServer[],
+		ambientDiscovery: AmbientMcpDiscoveryOptions | undefined,
+	): Promise<void> {
 		if (record.mcpManager) {
 			await record.mcpManager.disconnectAll();
 		}
@@ -3154,27 +3228,37 @@ export class AcpAgent implements Agent {
 		// stale tool set after this reconfiguration installs the new one.
 		await record.mcpRefreshChain;
 		record.mcpRefreshChain = undefined;
-		if (servers.length === 0) {
-			record.mcpManager = undefined;
-			await record.session.refreshMCPTools([]);
-			return;
+
+		let manager: MCPManager;
+		if (ambientDiscovery) {
+			const settings = record.session.settings;
+			const ambient = await discoverAndLoadMCPTools(record.session.sessionManager.getCwd(), {
+				enableProjectConfig: cfgMcpEnableProjectConfig.get(settings),
+				filterExa: true,
+				filterBrowser: cfgBrowserEnabled.get(settings),
+				cacheStorage: settings.getStorage(),
+				authStorage: record.session.modelRegistry.authStorage,
+				onStatus: event => {
+					if (event.type === "failed") this.#recordAmbientMcpDiagnostic(record, event.serverName);
+				},
+				onConfigWarning: () => this.#recordAmbientMcpDiagnostic(record, undefined),
+			});
+			manager = ambient.manager;
+		} else {
+			manager = new MCPManager(record.session.sessionManager.getCwd());
+		}
+		record.mcpManager = manager;
+
+		if (ambientDiscovery) {
+			for (const reservedName of ambientDiscovery.reservedServerNames) {
+				await manager.disconnectServer(reservedName);
+			}
+		}
+		if (cfgMcpNotifications.get(record.session.settings)) {
+			manager.setNotificationsEnabled(true);
 		}
 
-		const manager = new MCPManager(record.session.sessionManager.getCwd());
-		// `/mcp reauth` writes url-keyed credential rows; without the session's
-		// auth storage the manager cannot resolve them on reconnect and a
-		// successful reauthorization would leave the live server disconnected.
 		manager.setAuthStorage(record.session.modelRegistry.authStorage);
-		// MCP servers connect and reconnect independently, so `onToolsChanged` can fire
-		// several times back to back. Each firing is chained onto `record.mcpRefreshChain`
-		// so refreshes apply in order, and each one re-reads `manager.getTools()` at the
-		// time it actually runs rather than the snapshot from when it was queued — so a
-		// refresh can never apply a stale, smaller tool set after a newer one already landed.
-		// The returned promise propagates failures (a session-level
-		// `refreshMCPTools` rejection still fails setup); the stored chain
-		// swallows them after logging so background firings only warn and the
-		// chain never rejects. Connection failures do NOT fail setup — see
-		// below: the record keeps the manager so `/mcp reauth` can recover.
 		const enqueueMcpToolsRefresh = (): Promise<void> => {
 			const run = (record.mcpRefreshChain ?? Promise.resolve()).then(async () => {
 				if (record.mcpManager !== manager) return;
@@ -3188,12 +3272,14 @@ export class AcpAgent implements Agent {
 			return run;
 		};
 		manager.setOnToolsChanged(() => {
-			// Failures are logged once via the stored chain's catch above.
 			enqueueMcpToolsRefresh().catch(() => {});
 		});
+
 		const configs: MCPConfigMap = {};
 		const sources: MCPSourceMap = {};
 		for (const server of servers) {
+			// Client-supplied servers overlay ambient servers by name.
+			await manager.disconnectServer(server.name);
 			configs[server.name] = this.#toMcpConfig(server);
 			sources[server.name] = {
 				provider: "acp",
@@ -3203,7 +3289,21 @@ export class AcpAgent implements Agent {
 			};
 		}
 
-		const result = await manager.connectServers(configs, sources);
+		const requiredReadiness = new Map<string, PromiseWithResolvers<boolean>>();
+		for (const server of servers) {
+			if (ambientDiscovery?.reservedServerNames.has(server.name)) requiredReadiness.set(server.name, Promise.withResolvers<boolean>());
+		}
+		const result = await manager.connectServers(configs, sources, event => {
+			if (event.type === "connecting") return;
+			requiredReadiness.get(event.serverName)?.resolve(event.type === "connected");
+		});
+		for (const [name, readiness] of requiredReadiness) {
+			const timeout = resolveMCPTimeoutMs();
+			const ready = isMCPTimeoutEnabled(timeout)
+				? await withTimeout(readiness.promise, timeout, `Required client MCP server "${name}" did not report readiness within ${describeMCPTimeout(timeout)}`)
+				: await readiness.promise;
+			if (!ready) throw new Error(`Required client MCP server "${name}" failed to load tools`);
+		}
 		// A client-declared server whose initial connect fails (e.g. an expired
 		// client-owned bearer answering 401 inside the startup window) must not
 		// abort session creation: the record keeps the manager with the failed
